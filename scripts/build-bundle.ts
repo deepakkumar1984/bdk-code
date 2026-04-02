@@ -7,7 +7,7 @@
 
 import * as esbuild from 'esbuild'
 import { resolve, dirname } from 'path'
-import { chmodSync, readFileSync, existsSync } from 'fs'
+import { chmodSync, readFileSync, existsSync, statSync } from 'fs'
 import { fileURLToPath } from 'url'
 
 // Bun: import.meta.dir — Node 21+: import.meta.dirname — fallback
@@ -57,8 +57,94 @@ const srcResolverPlugin: esbuild.Plugin = {
         }
       }
 
-      // Let esbuild handle it (will error if truly missing)
+      // Stub missing src/ files — these are Anthropic-internal modules not
+      // present in this source tree (feature-gated at runtime).
+      return { path: args.path, namespace: 'missing-stub' }
+    })
+
+    build.onLoad({ filter: /.*/, namespace: 'missing-stub' }, (args) => {
+      console.warn(`[stub] Missing module: ${args.path}`)
+      return { contents: 'module.exports = {}', loader: 'js' }
+    })
+  },
+}
+
+// ── Plugin: stub missing relative imports ──
+// Some source files import modules that are Anthropic-internal and not
+// present in this tree. All such imports are feature-gated at runtime so
+// they are never actually called in an external build. We return an empty
+// stub so the bundle can complete without errors.
+function resolveRelative(importer: string, importPath: string): string | undefined {
+  const base = resolve(dirname(importer), importPath)
+
+  if (existsSync(base)) return base
+
+  // Strip .js/.jsx and try TypeScript extensions
+  const withoutExt = base.replace(/\.(js|jsx|d\.ts)$/, '')
+  for (const ext of ['.ts', '.tsx', '.js', '.jsx']) {
+    const candidate = withoutExt + ext
+    if (existsSync(candidate)) return candidate
+  }
+
+  // Try as directory with index file
+  const dirPath = base.replace(/\.(js|jsx)$/, '')
+  for (const ext of ['.ts', '.tsx', '.js', '.jsx']) {
+    const candidate = resolve(dirPath, 'index' + ext)
+    if (existsSync(candidate)) return candidate
+  }
+
+  return undefined
+}
+
+// ── Plugin: resolve CJS directory requires ──
+// Some CJS packages do `require("./some-dir")` expecting Node's automatic
+// index.js resolution. esbuild doesn't do this by default when it encounters
+// a directory path, so we resolve it ourselves.
+const cjsDirectoryResolverPlugin: esbuild.Plugin = {
+  name: 'cjs-directory-resolver',
+  setup(build) {
+    build.onResolve({ filter: /^\./ }, (args) => {
+      if (!args.importer) return undefined
+      const candidate = resolve(dirname(args.importer), args.path)
+      let stat: ReturnType<typeof statSync> | undefined
+      try { stat = statSync(candidate) } catch { return undefined }
+      if (!stat?.isDirectory()) return undefined
+
+      // The bare path resolves to a directory. First try the path as a file
+      // with common extensions (handles cases where a same-named file exists
+      // alongside the directory, e.g. terminal.js next to terminal/).
+      for (const ext of ['.js', '.cjs', '.mjs', '.ts', '.tsx']) {
+        const asFile = candidate + ext
+        if (existsSync(asFile)) return { path: asFile }
+      }
+
+      // Then try directory index files
+      for (const ext of ['.js', '.cjs', '.mjs', '.ts', '.tsx']) {
+        const idx = resolve(candidate, 'index' + ext)
+        if (existsSync(idx)) return { path: idx }
+      }
       return undefined
+    })
+  },
+}
+
+const missingModuleStubPlugin: esbuild.Plugin = {
+  name: 'missing-module-stub',
+  setup(build) {
+    // Intercept all relative imports before esbuild resolves them
+    build.onResolve({ filter: /^\.\.?\// }, (args) => {
+      const resolved = resolveRelative(args.importer, args.path)
+      if (resolved) {
+        // File exists — let esbuild handle it normally
+        return { path: resolved }
+      }
+      // File is missing — return a stub namespace
+      return { path: args.path, namespace: 'missing-stub' }
+    })
+
+    build.onLoad({ filter: /.*/, namespace: 'missing-stub' }, (args) => {
+      console.warn(`[stub] Missing module: ${args.path}`)
+      return { contents: 'module.exports = {}', loader: 'js' }
     })
   },
 }
@@ -75,7 +161,7 @@ const buildOptions: esbuild.BuildOptions = {
   // Single-file output — no code splitting for CLI tools
   splitting: false,
 
-  plugins: [srcResolverPlugin],
+  plugins: [srcResolverPlugin, cjsDirectoryResolverPlugin, missingModuleStubPlugin],
 
   // Use tsconfig for baseUrl / paths resolution (complements plugin above)
   tsconfig: resolve(ROOT, 'tsconfig.json'),
@@ -99,11 +185,28 @@ const buildOptions: esbuild.BuildOptions = {
     'fsevents',
     'sharp',
     'image-processor-napi',
+    'audio-capture-napi',
+    'color-diff-napi',
+    'modifiers-napi',
     // Anthropic-internal packages (not published externally)
     '@anthropic-ai/sandbox-runtime',
     '@anthropic-ai/claude-agent-sdk',
+    '@anthropic-ai/bedrock-sdk',
+    '@anthropic-ai/foundry-sdk',
+    '@anthropic-ai/mcpb',
+    '@anthropic-ai/vertex-sdk',
     // Anthropic-internal (@ant/) packages — gated behind USER_TYPE === 'ant'
     '@ant/*',
+    // AWS SDK + Smithy — CJS packages with directory requires; mark external
+    '@aws-sdk/*',
+    '@smithy/*',
+    // Azure / Google cloud auth
+    '@azure/*',
+    'google-auth-library',
+    // OpenTelemetry exporters — optional telemetry feature
+    '@opentelemetry/exporter-*',
+    '@opentelemetry/resources',
+    '@opentelemetry/semantic-conventions',
   ],
 
   jsx: 'automatic',
